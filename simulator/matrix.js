@@ -22,6 +22,15 @@ class MatrixDisplay {
     this._cy = 0;
     this._textColor = [255, 255, 255];
     this._textSize  = 1;
+
+    // Gamma correction LUT.
+    // LED panels use roughly linear PWM: value 128 = 50% brightness.
+    // Monitors apply ~2.2 gamma: CSS 128 = only ~22% brightness.
+    // This LUT pre-corrects values so the sim matches the real panel's brightness.
+    this._lut = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) {
+      this._lut[i] = Math.round(Math.pow(i / 255, 1 / 2.2) * 255);
+    }
   }
 
   // ── Color ──────────────────────────────────────────────────────────────────
@@ -120,9 +129,8 @@ class MatrixDisplay {
   }
 
   // ── Text ───────────────────────────────────────────────────────────────────
-  // Rendered via an offscreen canvas — character width is ~6px per char at
-  // textSize 1, matching Adafruit GFX spacing. Font appearance will differ
-  // slightly from the hardware glcdfont.c pixel font.
+  // Rendered via an offscreen canvas. Character width is ~6px at textSize 1,
+  // matching Adafruit GFX spacing. Font shape differs from the hardware glcdfont.c.
 
   setCursor(x, y)      { this._cx = x; this._cy = y; }
   setTextColor(color)  { this._textColor = this._c565(color); }
@@ -130,9 +138,8 @@ class MatrixDisplay {
 
   print(text) {
     const s = this._textSize;
-    const charH = 8 * s;
-    const offW  = text.length * 6 * s + 2;
-    const offH  = charH + 2;
+    const offW = text.length * 6 * s + 2;
+    const offH = 8 * s + 2;
 
     const off = document.createElement('canvas');
     off.width  = offW;
@@ -163,8 +170,9 @@ class MatrixDisplay {
   // ── Render to canvas ───────────────────────────────────────────────────────
 
   render() {
-    const { _ctx: ctx, W, H, pixelSize: ps, gap } = this;
+    const { _ctx: ctx, W, H, pixelSize: ps, gap, _lut } = this;
     const cell = ps + gap;
+    const radius = ps * 0.3; // LEDs have a slight circular lens, not sharp square edges
 
     ctx.fillStyle = '#080808';
     ctx.fillRect(0, 0, W * cell + gap, H * cell + gap);
@@ -176,14 +184,25 @@ class MatrixDisplay {
         const py = y * cell + gap;
 
         if (r === 0 && g === 0 && b === 0) {
-          ctx.fillStyle = '#151515';
+          // Dark "off" LED — slightly visible so you can see the grid
+          ctx.fillStyle = '#141414';
+          ctx.beginPath();
+          ctx.roundRect(px, py, ps, ps, radius);
+          ctx.fill();
         } else {
-          // Slight additive glow: draw a dimmer halo first
-          ctx.fillStyle = `rgba(${r},${g},${b},0.25)`;
+          // Gamma-corrected color
+          const cr = _lut[r], cg = _lut[g], cb = _lut[b];
+
+          // Bloom: faint halo bleeds into the surrounding gap pixels
+          ctx.fillStyle = `rgba(${cr},${cg},${cb},0.22)`;
           ctx.fillRect(px - 1, py - 1, ps + 2, ps + 2);
-          ctx.fillStyle = `rgb(${r},${g},${b})`;
+
+          // LED face
+          ctx.fillStyle = `rgb(${cr},${cg},${cb})`;
+          ctx.beginPath();
+          ctx.roundRect(px, py, ps, ps, radius);
+          ctx.fill();
         }
-        ctx.fillRect(px, py, ps, ps);
       }
     }
   }

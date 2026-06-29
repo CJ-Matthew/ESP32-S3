@@ -28,10 +28,10 @@
     }
 
     #panel-wrap {
-      border: 1px solid #222;
+      border: 1px solid #1e1e1e;
       border-radius: 6px;
       overflow: hidden;
-      box-shadow: 0 0 40px rgba(0,0,0,0.8);
+      box-shadow: 0 0 60px rgba(0,0,0,0.9);
     }
 
     #panel { display: block; }
@@ -39,35 +39,46 @@
     #controls {
       display: flex;
       align-items: center;
-      gap: 20px;
+      gap: 12px;
+      flex-wrap: wrap;
+      justify-content: center;
     }
 
-    button {
+    button, select {
       background: #1e1e1e;
       color: #bbb;
       border: 1px solid #333;
       border-radius: 4px;
-      padding: 5px 14px;
+      padding: 5px 12px;
       font-family: inherit;
       font-size: 12px;
       cursor: pointer;
+      outline: none;
     }
-    button:hover { background: #2a2a2a; color: #fff; }
+    button:hover, select:hover { background: #2a2a2a; color: #fff; }
 
-    #info {
+    #fps-wrap {
+      display: flex;
+      align-items: center;
+      gap: 8px;
       color: #444;
       font-size: 11px;
     }
 
-    #fps { color: #3a7; }
+    .label { color: #555; }
+    #fps-actual { color: #3a7; min-width: 2.5ch; }
+    #fps-target-label { color: #666; }
+    #frame { color: #444; }
+
+    .sep { color: #333; }
 
     footer {
-      color: #333;
+      color: #2e2e2e;
       font-size: 11px;
       text-align: center;
-      line-height: 1.7;
+      line-height: 1.8;
     }
-    footer code { color: #555; }
+    footer code { color: #444; }
   </style>
 </head>
 <body>
@@ -79,23 +90,50 @@
 
   <div id="controls">
     <button id="btn-pause">Pause</button>
-    <span id="info">
-      <span id="fps">–</span> fps &nbsp;|&nbsp; frame <span id="frame">0</span>
-    </span>
+    <button id="btn-step" disabled>Step</button>
+
+    <div id="fps-wrap">
+      <span class="label">target</span>
+      <select id="fps-select">
+        <option value="15">15 fps</option>
+        <option value="20">20 fps</option>
+        <option value="30" selected>30 fps</option>
+        <option value="45">45 fps</option>
+        <option value="60">60 fps</option>
+        <option value="0">uncapped</option>
+      </select>
+      <span class="sep">|</span>
+      <span class="label">actual</span>
+      <span id="fps-actual">–</span>
+      <span class="sep">|</span>
+      <span class="label">frame</span>
+      <span id="frame">0</span>
+    </div>
   </div>
 
   <footer>
-    Edit <code>sketch.js</code> then reload — <code>display.*</code> mirrors <code>dma_display-&gt;*</code><br>
-    <code>millis()</code> works. <code>delay()</code> is a no-op — use <code>millis()</code> for timing.
+    Edit <code>sketch.js</code> and reload &mdash; <code>display.*</code> mirrors <code>dma_display-&gt;*</code><br>
+    <code>millis()</code> and <code>random()</code> work. <code>delay()</code> is a no-op &mdash; use <code>millis()</code> for timing.
   </footer>
 
   <script>
-    // Provide Arduino-compatible globals in sketch.js scope
-    const _t0 = Date.now();
-    window.millis = () => Date.now() - _t0;
-    window.delay  = () => {};  // no-op
-    window.map    = (v, iL, iH, oL, oH) => oL + (v - iL) * (oH - oL) / (iH - iL);
+    // Arduino-compatible globals available in sketch.js
+    const _t0 = performance.now();
+    window.millis    = () => Math.floor(performance.now() - _t0);
+    window.micros    = () => Math.floor((performance.now() - _t0) * 1000);
+    window.delay     = () => {};
+    window.random    = (a, b) => b === undefined
+      ? Math.floor(Math.random() * a)
+      : Math.floor(Math.random() * (b - a)) + a;
+    window.map       = (v, iL, iH, oL, oH) => oL + (v - iL) * (oH - oL) / (iH - iL);
     window.constrain = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+    window.abs       = Math.abs;
+    window.min       = Math.min;
+    window.max       = Math.max;
+    window.sin       = (a) => Math.sin(a);  // Arduino sin() takes radians too
+    window.cos       = (a) => Math.cos(a);
+    window.sqrt      = Math.sqrt;
+    window.PI        = Math.PI;
   </script>
   <script src="matrix.js"></script>
   <script src="sketch.js"></script>
@@ -105,38 +143,70 @@
     if (typeof setup === 'function') setup(display);
     display.render();
 
-    let paused    = false;
-    let frameCount = 0;
-    let lastFpsTime = Date.now();
-    let fpsFrames   = 0;
+    let paused       = false;
+    let frameCount   = 0;
+    let targetFPS    = 30;
+    let frameInterval = 1000 / targetFPS;  // ms per frame
+    let lastFrameTime = 0;
 
-    const fpsEl   = document.getElementById('fps');
+    // FPS measurement
+    let measuredFrames = 0;
+    let measuredStart  = performance.now();
+
+    const fpsEl   = document.getElementById('fps-actual');
     const frameEl = document.getElementById('frame');
     const btnPause = document.getElementById('btn-pause');
+    const btnStep  = document.getElementById('btn-step');
+    const fpsSelect = document.getElementById('fps-select');
+
+    fpsSelect.addEventListener('change', () => {
+      targetFPS = parseInt(fpsSelect.value, 10);
+      frameInterval = targetFPS === 0 ? 0 : 1000 / targetFPS;
+    });
 
     btnPause.addEventListener('click', () => {
       paused = !paused;
       btnPause.textContent = paused ? 'Resume' : 'Pause';
-      if (!paused) requestAnimationFrame(tick);
+      btnStep.disabled = !paused;
+      if (!paused) {
+        measuredStart = performance.now();
+        measuredFrames = 0;
+        requestAnimationFrame(tick);
+      }
     });
 
-    function tick() {
+    btnStep.addEventListener('click', () => {
+      if (!paused) return;
+      runFrame();
+      display.render();
+      frameEl.textContent = frameCount;
+    });
+
+    function runFrame() {
+      if (typeof loop === 'function') loop(display);
+      frameCount++;
+    }
+
+    function tick(now) {
       if (paused) return;
 
-      if (typeof loop === 'function') {
-        loop(display);
+      const elapsed = now - lastFrameTime;
+
+      if (elapsed >= frameInterval) {
+        // Snap to prevent frame-time drift accumulating
+        lastFrameTime = frameInterval > 0 ? now - (elapsed % frameInterval) : now;
+
+        runFrame();
         display.render();
-      }
+        frameEl.textContent = frameCount;
 
-      frameCount++;
-      fpsFrames++;
-      frameEl.textContent = frameCount;
-
-      const now = Date.now();
-      if (now - lastFpsTime >= 500) {
-        fpsEl.textContent = Math.round(fpsFrames * 1000 / (now - lastFpsTime));
-        fpsFrames   = 0;
-        lastFpsTime = now;
+        measuredFrames++;
+        const measureElapsed = now - measuredStart;
+        if (measureElapsed >= 500) {
+          fpsEl.textContent = Math.round(measuredFrames * 1000 / measureElapsed);
+          measuredFrames = 0;
+          measuredStart  = now;
+        }
       }
 
       requestAnimationFrame(tick);
