@@ -8,6 +8,9 @@ build/
 # Arduino IDE temp files
 *.bak
 
+# WiFi credentials — never commit
+**/secrets.h
+
 # macOS
 .DS_Store
 

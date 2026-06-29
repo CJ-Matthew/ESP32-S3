@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>64×32 LED Matrix Simulator</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #111;
+      color: #aaa;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 13px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 32px 16px;
+      gap: 16px;
+      min-height: 100vh;
+    }
+
+    h1 {
+      font-size: 14px;
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      color: #555;
+      text-transform: uppercase;
+    }
+
+    #panel-wrap {
+      border: 1px solid #222;
+      border-radius: 6px;
+      overflow: hidden;
+      box-shadow: 0 0 40px rgba(0,0,0,0.8);
+    }
+
+    #panel { display: block; }
+
+    #controls {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+    }
+
+    button {
+      background: #1e1e1e;
+      color: #bbb;
+      border: 1px solid #333;
+      border-radius: 4px;
+      padding: 5px 14px;
+      font-family: inherit;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    button:hover { background: #2a2a2a; color: #fff; }
+
+    #info {
+      color: #444;
+      font-size: 11px;
+    }
+
+    #fps { color: #3a7; }
+
+    footer {
+      color: #333;
+      font-size: 11px;
+      text-align: center;
+      line-height: 1.7;
+    }
+    footer code { color: #555; }
+  </style>
+</head>
+<body>
+  <h1>64 &times; 32 LED Matrix Simulator</h1>
+
+  <div id="panel-wrap">
+    <canvas id="panel"></canvas>
+  </div>
+
+  <div id="controls">
+    <button id="btn-pause">Pause</button>
+    <span id="info">
+      <span id="fps">–</span> fps &nbsp;|&nbsp; frame <span id="frame">0</span>
+    </span>
+  </div>
+
+  <footer>
+    Edit <code>sketch.js</code> then reload — <code>display.*</code> mirrors <code>dma_display-&gt;*</code><br>
+    <code>millis()</code> works. <code>delay()</code> is a no-op — use <code>millis()</code> for timing.
+  </footer>
+
+  <script>
+    // Provide Arduino-compatible globals in sketch.js scope
+    const _t0 = Date.now();
+    window.millis = () => Date.now() - _t0;
+    window.delay  = () => {};  // no-op
+    window.map    = (v, iL, iH, oL, oH) => oL + (v - iL) * (oH - oL) / (iH - iL);
+    window.constrain = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+  </script>
+  <script src="matrix.js"></script>
+  <script src="sketch.js"></script>
+  <script>
+    const display = new MatrixDisplay('panel');
+
+    if (typeof setup === 'function') setup(display);
+    display.render();
+
+    let paused    = false;
+    let frameCount = 0;
+    let lastFpsTime = Date.now();
+    let fpsFrames   = 0;
+
+    const fpsEl   = document.getElementById('fps');
+    const frameEl = document.getElementById('frame');
+    const btnPause = document.getElementById('btn-pause');
+
+    btnPause.addEventListener('click', () => {
+      paused = !paused;
+      btnPause.textContent = paused ? 'Resume' : 'Pause';
+      if (!paused) requestAnimationFrame(tick);
+    });
+
+    function tick() {
+      if (paused) return;
+
+      if (typeof loop === 'function') {
+        loop(display);
+        display.render();
+      }
+
+      frameCount++;
+      fpsFrames++;
+      frameEl.textContent = frameCount;
+
+      const now = Date.now();
+      if (now - lastFpsTime >= 500) {
+        fpsEl.textContent = Math.round(fpsFrames * 1000 / (now - lastFpsTime));
+        fpsFrames   = 0;
+        lastFpsTime = now;
+      }
+
+      requestAnimationFrame(tick);
+    }
+
+    requestAnimationFrame(tick);
+  </script>
+</body>
+</html>
