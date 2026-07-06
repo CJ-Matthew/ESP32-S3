@@ -93,6 +93,29 @@
     <button id="btn-step" disabled>Step</button>
 
     <div id="fps-wrap">
+      <span class="label">face</span>
+      <select id="face-select"></select>
+
+      <span class="sep">|</span>
+      <span class="label">weather</span>
+      <select id="weather-select">
+        <option value="sunny">sunny</option>
+        <option value="cloudy">cloudy</option>
+        <option value="rainy">rainy</option>
+      </select>
+
+      <span class="sep">|</span>
+      <span class="label">people</span>
+      <select id="people-select" title="mock roster — ignored when live presence data is available">
+        <option value="0">0</option>
+        <option value="1" selected>1</option>
+        <option value="2">2</option>
+        <option value="3">3</option>
+        <option value="4">4</option>
+        <option value="5">5</option>
+      </select>
+
+      <span class="sep">|</span>
       <span class="label">target</span>
       <select id="fps-select">
         <option value="15">15 fps</option>
@@ -112,12 +135,12 @@
   </div>
 
   <footer>
-    Edit <code>sketch.js</code> and reload &mdash; <code>display.*</code> mirrors <code>dma_display-&gt;*</code><br>
-    <code>millis()</code> and <code>random()</code> work. <code>delay()</code> is a no-op &mdash; use <code>millis()</code> for timing.
+    Add a face: <code>registerFace('Name', { setup(d){}, loop(d){} })</code> in a new <code>.js</code> file, then add a <code>&lt;script&gt;</code> tag below.<br>
+    <code>display.*</code> mirrors <code>dma_display-&gt;*</code> &mdash; <code>millis()</code>, <code>random()</code>, <code>sin()</code>, <code>cos()</code> available.
   </footer>
 
+  <!-- Arduino-compatible globals -->
   <script>
-    // Arduino-compatible globals available in sketch.js
     const _t0 = performance.now();
     window.millis    = () => Math.floor(performance.now() - _t0);
     window.micros    = () => Math.floor((performance.now() - _t0) * 1000);
@@ -130,31 +153,121 @@
     window.abs       = Math.abs;
     window.min       = Math.min;
     window.max       = Math.max;
-    window.sin       = (a) => Math.sin(a);  // Arduino sin() takes radians too
+    window.sin       = (a) => Math.sin(a);
     window.cos       = (a) => Math.cos(a);
     window.sqrt      = Math.sqrt;
     window.PI        = Math.PI;
-  </script>
+
+    // Face registry — face files call registerFace() to add themselves
+    window._faces = [];
+    window.registerFace = (name, face) => window._faces.push({ name, ...face });
+
+    // Shared state readable by any face
+    //   weatherMode: 'sunny' | 'cloudy' | 'rainy' — drives the whole face palette
+    //   temperature: live °C from backend /weather, or null (→ placeholder)
+    window.weatherMode = 'sunny';
+    window.temperature = null;
+
+    // House presence — one critter per person home.
+    //   houseRoster: live data [{ mac_address, name, colour }] or null (→ use mock)
+    //   mockPeople:  fallback count when there's no live data (file:// / offline)
+    window.houseRoster = null;
+    window.mockPeople  = 1;
+</script>
+
   <script src="matrix.js"></script>
+
+  <!-- ── Face files — add a <script> tag here for each new face ── -->
   <script src="sketch.js"></script>
+  <script src="face_clock_a.js"></script>
+
   <script>
     const display = new MatrixDisplay('panel');
 
-    if (typeof setup === 'function') setup(display);
+    // Populate face selector
+    const faceSelect = document.getElementById('face-select');
+    window._faces.forEach((f, i) => {
+      const opt = document.createElement('option');
+      opt.value = i;
+      opt.textContent = f.name;
+      faceSelect.appendChild(opt);
+    });
+
+    // Weather selector
+    const weatherSelect = document.getElementById('weather-select');
+    weatherSelect.addEventListener('change', () => {
+      window.weatherMode = weatherSelect.value;
+    });
+
+    // People (mock roster) selector — only used when there's no live data
+    const peopleSelect = document.getElementById('people-select');
+    peopleSelect.addEventListener('change', () => {
+      window.mockPeople = parseInt(peopleSelect.value, 10);
+    });
+
+    // Live roster poll (every 10s). Fetches a SAME-ORIGIN /connected, so it works
+    // when the sim is served behind the dev proxy (which injects the API key and
+    // forwards to the backend). On file:// it's skipped and the mock count is used.
+    async function pollRoster() {
+      if (!location.protocol.startsWith('http')) return;   // file:// → mock only
+      try {
+        const res = await fetch('./connected', { cache: 'no-store' });
+        if (!res.ok) return;
+        const data = await res.json();
+        window.houseRoster = Array.isArray(data.connected_devices)
+          ? data.connected_devices : null;
+      } catch (_) { /* proxy down / offline — keep last-known or mock */ }
+    }
+    pollRoster();
+    setInterval(pollRoster, 10000);
+
+    // Live weather poll (every 60s). Same-origin /weather via the dev proxy sets the
+    // condition (which drives the whole palette) and the temperature. On file:// it's
+    // skipped, so the weather dropdown drives the palette and the temp shows a placeholder.
+    async function pollWeather() {
+      if (!location.protocol.startsWith('http')) return;
+      try {
+        const res = await fetch('./weather', { cache: 'no-store' });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (['sunny', 'cloudy', 'rainy'].includes(data.condition)) {
+          window.weatherMode = data.condition;
+          weatherSelect.value = data.condition;         // reflect live value in the dropdown
+        }
+        const temp = Number(data.temperature);
+        if (Number.isFinite(temp)) window.temperature = temp;
+      } catch (_) { /* proxy down / offline — keep dropdown + placeholder */ }
+    }
+    pollWeather();
+    setInterval(pollWeather, 60000);
+
+    // Active face
+    let activeFace = window._faces[0];
+    if (activeFace?.setup) activeFace.setup(display);
     display.render();
 
-    let paused       = false;
-    let frameCount   = 0;
-    let targetFPS    = 30;
-    let frameInterval = 1000 / targetFPS;  // ms per frame
+    faceSelect.addEventListener('change', () => {
+      activeFace = window._faces[parseInt(faceSelect.value)];
+      display.clearScreen();
+      display.render();
+      if (activeFace?.setup) activeFace.setup(display);
+      frameCount = 0;
+      measuredFrames = 0;
+      measuredStart = performance.now();
+    });
+
+    // ── Loop ──────────────────────────────────────────────────────────────────
+    let paused        = false;
+    let frameCount    = 0;
+    let targetFPS     = 30;
+    let frameInterval = 1000 / targetFPS;
     let lastFrameTime = 0;
 
-    // FPS measurement
     let measuredFrames = 0;
     let measuredStart  = performance.now();
 
-    const fpsEl   = document.getElementById('fps-actual');
-    const frameEl = document.getElementById('frame');
+    const fpsEl    = document.getElementById('fps-actual');
+    const frameEl  = document.getElementById('frame');
     const btnPause = document.getElementById('btn-pause');
     const btnStep  = document.getElementById('btn-step');
     const fpsSelect = document.getElementById('fps-select');
@@ -183,7 +296,7 @@
     });
 
     function runFrame() {
-      if (typeof loop === 'function') loop(display);
+      if (activeFace?.loop) activeFace.loop(display);
       frameCount++;
     }
 
@@ -193,7 +306,6 @@
       const elapsed = now - lastFrameTime;
 
       if (elapsed >= frameInterval) {
-        // Snap to prevent frame-time drift accumulating
         lastFrameTime = frameInterval > 0 ? now - (elapsed % frameInterval) : now;
 
         runFrame();

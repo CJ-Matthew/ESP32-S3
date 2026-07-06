@@ -41,8 +41,5 @@ Arduino globals available in `sketch.js`: `millis()`, `micros()`, `random()`, `d
 
 FPS target is configurable in the UI (default 30 fps). Gamma correction is applied so mid-range colours match real panel brightness.
 
-## Key constraints
-
-- No public IP — ESP32 sits behind home router NAT. Backend communication must be ESP32-initiated (polling or WebSocket out to server, or MQTT).
-- WiFi credentials live in `secrets.h` which is gitignored.
-- Flash: WiFi stack alone consumes ~65% of the 1.28MB flash. ~450KB remains for display library and application code.
+## README.md
+Keep the read me upto date as changes evolve
