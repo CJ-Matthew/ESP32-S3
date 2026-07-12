@@ -21,7 +21,7 @@ deliberate second pass.
   │  _display_state = {      │   GET  /connected      (every 15–30s) │        └─ dma_display  │
   │     "face": "clock"     │                                       │           (HUB75)     │
   │  }                      │                                       └───────────────────────┘
-  │  scheduler thread ──────┼── flips face at 23:30 / 06:00
+  │  scheduler thread ──────┼── flips face at 23:30 / 07:00
   │    (Australia/Sydney)   │      (Sydney local time)
   └────────────────────────┘
 ```
@@ -91,10 +91,10 @@ _state = {"face": "clock"}      # guarded by a threading.Lock
 
 A daemon thread (mirrors `presence_logger.start()`) flips the face at boundaries:
 
-| Boundary (Sydney local) | Face   |
-|-------------------------|--------|
-| 23:30                   | `fire` |
-| 06:00                   | `clock`|
+| Boundary (Sydney local) | Face        |
+|-------------------------|-------------|
+| 23:30                   | `starfield` |
+| 07:00                   | `clock`     |
 
 - **Anchored explicitly to `Australia/Sydney`** via `zoneinfo.ZoneInfo` — NOT the
   host's local clock. The server is in US-West California; we do **not** add a
@@ -169,8 +169,11 @@ The render loop **never blocks** on missing data — it draws with what it last 
 | Presence roster    | zero critters (empty grass)                           |
 | WiFi / backend down| keep last-known values; short ~2–3 s HTTP timeout, retry |
 
-The **fire face needs no backend data** — it renders identically offline, so the
-23:30 auto-switch looks right even if the backend is unreachable.
+The **starfield and fire faces need no backend data** — the moon phase is computed
+from NTP time, so the starfield renders right (moon, stars, shooting stars, clock)
+even if the backend is unreachable. Only the weather-driven dimming and cloud/rain
+overlays go quiet without `/weather`. (The 23:30 switch itself is backend-driven,
+so if the backend is down the panel holds whatever face it last had.)
 
 ---
 
@@ -227,3 +230,49 @@ Test-time gotchas:
 
 Prove the novel part (two cores + polling + switching without stutter) with a
 glance-verifiable clock before porting the pixel-art.
+
+---
+
+## 7. Spotify "now playing" face
+
+A fourth face (`spotify`) shows the current track: a 30×30 album cover, scrolling
+title/artist, an elapsed timer, and a progress bar.
+
+### 7.1 Why the backend does the work
+
+The ESP32 can neither run Spotify's OAuth flow nor decode a JPEG mid-render, so
+`backend/spotify.py` owns both:
+
+- **Auth:** a one-time browser consent (`python3 -m backend.spotify_auth`) mints a
+  long-lived `SPOTIFY_REFRESH_TOKEN`. The backend swaps it for short-lived access
+  tokens and calls `GET /v1/me/player/currently-playing`. Results cache 2 s.
+- **Album art:** the backend downloads Spotify's smallest image, resizes it to
+  30×30 with **Pillow**, and serves raw **RGB565** (big-endian, 1800 bytes). The
+  firmware just blits it — no decoding. Art is cached per `track_id`.
+
+### 7.2 Endpoints
+
+| Method | Route             | Response                                                        |
+|--------|-------------------|----------------------------------------------------------------|
+| GET    | `/spotify/state`  | JSON: `active, playing, title, artist, duration_ms, progress_ms, track_id, has_art` |
+| GET    | `/spotify/art`    | raw RGB565 bytes (1800) for the current cover, or **204** if none |
+
+`active:false` = Spotify closed/idle (→ idle screen). `playing:false` + `active:true`
+= paused (→ dimmed track + pause glyph, frozen progress).
+
+### 7.3 Firmware
+
+- Polls `/spotify/state` every **5 s, only while the spotify face is showing** (so
+  the Spotify API isn't hit all day). Fetches `/spotify/art` **only when `track_id`
+  changes**.
+- Elapsed time is **interpolated from `millis()`** between polls, so the bar sweeps
+  smoothly while playing.
+- Graceful degradation: no art → dim placeholder square; backend/Spotify down →
+  keep last-known; nothing playing → idle screen.
+
+### 7.4 Config
+
+- Backend env: `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `SPOTIFY_REFRESH_TOKEN`;
+  `requirements.txt` adds `Pillow`. Redirect URI `http://127.0.0.1:8888/callback`
+  must be registered in the Spotify app.
+- Firmware: **no new secrets** — reuses `BACKEND_BASE_URL` + `BACKEND_API_KEY`.

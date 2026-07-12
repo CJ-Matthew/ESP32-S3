@@ -40,6 +40,27 @@ RosterEntry       rosterShared[MAX_PEOPLE];
 volatile int      rosterCount = 0;
 SemaphoreHandle_t rosterMutex = nullptr;
 
+// Spotify "now playing" from /spotify/state + /spotify/art (network writes, render
+// reads, guarded by spotifyMutex). progressAtMillis lets the render core interpolate
+// elapsed time between polls so the progress bar sweeps smoothly.
+static const int ALBUM_ART = 30;                 // cover is 30×30 px (matches backend)
+struct SpotifyState {
+  bool     active;                               // is a track loaded? (false → idle screen)
+  bool     playing;                              // playing vs paused
+  char     title[64];
+  char     artist[64];
+  char     trackId[24];
+  uint32_t durationMs;
+  uint32_t progressMs;
+  uint32_t progressAtMillis;                     // millis() when progressMs was captured
+  bool     hasArt;
+};
+SpotifyState      spotifyShared = {};
+uint16_t          albumArt[ALBUM_ART * ALBUM_ART];   // RGB565 cover, guarded by spotifyMutex
+bool              albumArtValid = false;
+SemaphoreHandle_t spotifyMutex = nullptr;
+int               spotifyFaceId = -1;            // index of the spotify face (set in setup)
+
 // ── Face interface ───────────────────────────────────────────────────────────
 struct Face {
   const char* id;                              // slug — must match backend + simulator
@@ -52,11 +73,17 @@ void clockSetup();
 void clockLoop(MatrixPanel_I2S_DMA* d);
 void fireSetup();
 void fireLoop(MatrixPanel_I2S_DMA* d);
+void starfieldSetup();
+void starfieldLoop(MatrixPanel_I2S_DMA* d);
+void spotifySetup();
+void spotifyLoop(MatrixPanel_I2S_DMA* d);
 
 // Registry. Add a face = write two functions + one entry here + a backend slug.
 Face faces[] = {
-  { "clock", clockSetup, clockLoop },
-  { "fire",  fireSetup,  fireLoop  },
+  { "clock",     clockSetup,     clockLoop     },
+  { "fire",      fireSetup,      fireLoop      },
+  { "starfield", starfieldSetup, starfieldLoop },
+  { "spotify",   spotifySetup,   spotifyLoop   },
 };
 static const int FACE_COUNT = sizeof(faces) / sizeof(faces[0]);
 
@@ -499,6 +526,353 @@ void fireLoop(MatrixPanel_I2S_DMA* d) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+//  STARFIELD FACE  (ported from simulator/face_starfield.js — parallax stars,
+//  the moon at tonight's real phase, an occasional shooting star, weather in the
+//  sky, and a dim HH:MM in the corner.)
+// ═════════════════════════════════════════════════════════════════════════════
+namespace starfield {
+  const int W = 64, H = 32;
+
+  // Moon geometry — top-right, ~11px disc.
+  const int  MOON_CX = 50, MOON_CY = 9, MOON_R = 5;
+  // Southern hemisphere (Sydney): the waxing moon is lit on the LEFT — flip the
+  // terminator so the drawn phase matches what's actually out the window.
+  const bool SOUTHERN = true;
+
+  // Synodic month (new moon → new moon) and a known reference new moon, as a Unix
+  // timestamp: 2000-01-06 18:14:00 UTC. age = (now − epoch) mod SYNODIC.
+  const double SYNODIC        = 29.530588853;   // days
+  const time_t NEW_MOON_EPOCH = 947182440;      // seconds
+
+  // Three parallax depth layers: nearer stars are brighter, drift faster, twinkle
+  // harder. Gives the sky depth.
+  const float LAYER_SPEED[3]   = { 0.12f, 0.30f, 0.60f };   // px / second
+  const int   LAYER_BRIGHT[3]  = { 60,    110,   190   };   // peak brightness
+  const float LAYER_TWINKLE[3] = { 0.15f, 0.30f, 0.50f };   // twinkle depth
+
+  const int STAR_COUNT = 55;
+  struct Star { float x, y; uint8_t layer; float base, phase, rate, tr, tg, tb; };
+  Star stars[STAR_COUNT];
+
+  struct Shoot { bool active; float x0, y0, vx, vy; uint32_t t0, dur; };
+  Shoot    shoot     = { false, 0, 0, 0, 0, 0, 0 };
+  uint32_t nextShoot = 0;
+
+  // Multiply an RGB by a factor (twinkle / weather-dim / fade) → a clamped 565.
+  inline uint16_t scol(MatrixPanel_I2S_DMA* d, float r, float g, float b, float f) {
+    return d->color565(constrain((int)(r * f), 0, 255),
+                       constrain((int)(g * f), 0, 255),
+                       constrain((int)(b * f), 0, 255));
+  }
+
+  // Illumination phase 0..1 for a time: 0 = new, 0.5 = full, → 1 back to new.
+  double moonPhase(time_t nowSec) {
+    double days = (double)(nowSec - NEW_MOON_EPOCH) / 86400.0;
+    double p = fmod(days, SYNODIC) / SYNODIC;
+    return p < 0 ? p + 1 : p;
+  }
+
+  // Moon at `phase`, dimmed by `dim`. Lit side pale white; dark limb a faint
+  // blue-grey "earthshine" so the whole disc stays visible. A few crater pixels.
+  void drawMoon(MatrixPanel_I2S_DMA* d, double phase, float dim) {
+    float a = cosf(2.0f * PI * (float)phase);   // terminator bulge: +1 new … −1 full
+    bool  waxing = phase < 0.5;
+    const int craters[][2] = { {-2, -1}, {1, 1}, {0, 2}, {2, -2} };
+
+    for (int dy = -MOON_R; dy <= MOON_R; dy++) {
+      float hw = sqrtf((float)(MOON_R * MOON_R - dy * dy));   // disc half-width at row
+      for (int dx = -MOON_R; dx <= MOON_R; dx++) {
+        if (dx * dx + dy * dy > MOON_R * MOON_R) continue;    // outside the disc
+        int   px  = SOUTHERN ? -dx : dx;                      // flip lit side for Sydney
+        float xt  = a * hw;                                   // terminator x at this row
+        bool  lit = waxing ? (px >= xt) : (px <= -xt);
+        int X = MOON_CX + dx, Y = MOON_CY + dy;
+        if (lit) {
+          float f = 1.0f;
+          for (auto& c : craters) if (c[0] == dx && c[1] == dy) f = 0.72f;
+          d->drawPixel(X, Y, scol(d, 235, 238, 248, f * dim));
+        } else {
+          d->drawPixel(X, Y, scol(d, 30, 35, 55, dim));       // earthshine
+        }
+      }
+    }
+  }
+
+  // A soft grey cloud blob centred at (cx, cy) — reused for the cloudy sky.
+  void cloudBlob(MatrixPanel_I2S_DMA* d, int cx, int cy) {
+    uint16_t g  = d->color565(118, 122, 134);
+    uint16_t hi = d->color565(150, 154, 165);
+    d->fillRect(cx - 1, cy, 9, 3, g);
+    d->fillCircle(cx,     cy,     2, g);
+    d->fillCircle(cx + 3, cy,     2, g);
+    d->fillCircle(cx + 6, cy + 1, 2, g);
+    d->fillCircle(cx + 2, cy - 1, 2, hi);   // lit crown
+  }
+}
+
+void starfieldSetup() {
+  using namespace starfield;
+  for (int i = 0; i < STAR_COUNT; i++) {
+    int layer = random(0, 3);
+    // Colour: mostly white, some cool blue, a few warm — a real sky isn't grey.
+    int r = random(0, 100);
+    float tr, tg, tb;
+    if      (r < 70) { tr = 1.00f; tg = 1.00f; tb = 1.00f; }
+    else if (r < 88) { tr = 0.72f; tg = 0.82f; tb = 1.00f; }
+    else             { tr = 1.00f; tg = 0.90f; tb = 0.78f; }
+    stars[i].x     = random(0, W);
+    stars[i].y     = random(0, H);
+    stars[i].layer = layer;
+    stars[i].base  = LAYER_BRIGHT[layer] * (0.6f + random(0, 40) / 100.0f);
+    stars[i].phase = random(0, 628) / 100.0f;
+    stars[i].rate  = (80 + random(0, 240)) / 100.0f;    // twinkle speed
+    stars[i].tr = tr; stars[i].tg = tg; stars[i].tb = tb;
+  }
+  shoot.active = false;
+  nextShoot    = millis() + 3000 + random(0, 6000);     // first one appears soon
+}
+
+void starfieldLoop(MatrixPanel_I2S_DMA* d) {
+  using namespace starfield;
+  float    t   = millis() / 1000.0f;
+  uint32_t now = millis();
+  d->fillScreen(0);
+
+  // Weather reaches the sky: rain darkens it most, cloud a little.
+  float dim = (weatherMode == 2) ? 0.45f : (weatherMode == 1) ? 0.80f : 1.0f;
+
+  // ── Stars (parallax drift + per-star twinkle) ──
+  for (int i = 0; i < STAR_COUNT; i++) {
+    Star& s = stars[i];
+    float xf = fmodf(fmodf(s.x - LAYER_SPEED[s.layer] * t, (float)W) + W, (float)W);
+    int   x  = (int)roundf(xf);
+    int   y  = (int)s.y;
+    float depth = LAYER_TWINKLE[s.layer];
+    float tw = 1 - depth + depth * (0.5f + 0.5f * sinf(t * s.rate + s.phase));
+    float f  = s.base * tw * dim;
+    d->drawPixel(x, y, scol(d, 255 * s.tr, 255 * s.tg, 255 * s.tb, f / 255.0f));
+  }
+
+  // ── Moon at tonight's real phase (drawn over the stars) ──
+  drawMoon(d, moonPhase(time(nullptr)), dim);
+
+  // ── Shooting star ──
+  if (!shoot.active && now >= nextShoot) {
+    int dir = (random(0, 2) == 0) ? 1 : -1;                 // down-right or down-left
+    int x0  = (dir == 1) ? random(2, 30) : random(34, 62);
+    shoot.active = true; shoot.x0 = x0; shoot.y0 = random(2, 10);
+    shoot.vx = dir * 20; shoot.vy = 9; shoot.t0 = now; shoot.dur = 500 + random(0, 300);
+    nextShoot = now + shoot.dur + 12000 + random(0, 22000);  // long quiet gap after
+  }
+  if (shoot.active) {
+    float p = (float)(now - shoot.t0) / shoot.dur;
+    if (p >= 1) {
+      shoot.active = false;
+    } else {
+      for (int k = 0; k < 4; k++) {                          // head + fading tail
+        float q = p - k * 0.06f;
+        if (q < 0) continue;
+        int tx = (int)roundf(shoot.x0 + shoot.vx * q);
+        int ty = (int)roundf(shoot.y0 + shoot.vy * q);
+        d->drawPixel(tx, ty, scol(d, 255, 255, 255, (1 - p) * (1 - k * 0.28f)));
+      }
+    }
+  }
+
+  // ── Cloudy: slow drifting blobs that pass over the sky ──
+  if (weatherMode == 1) {
+    float drift = t * 4;                                     // px / second
+    cloudBlob(d, (int)fmodf(drift,      (float)(W + 24)) - 12, 6);
+    cloudBlob(d, (int)fmodf(drift + 34, (float)(W + 24)) - 12, 13);
+  }
+
+  // ── Rainy: a light diagonal drizzle over a darkened sky ──
+  if (weatherMode == 2) {
+    for (int i = 0; i < 12; i++) {
+      float speed = 0.9f + (i % 3) * 0.2f;
+      float phase = fmodf(t * speed + i * 0.37f, 1.0f);
+      int   x = (i * 7 + 3) % W;
+      int   y = (int)(phase * H);
+      d->drawPixel(x,     y,     d->color565(70, 130, 210));
+      d->drawPixel(x + 1, y + 1, d->color565(45,  90, 150));
+    }
+  }
+
+  // ── Dim HH:MM in the corner so it's still a bedside clock at night ──
+  time_t nowSec = time(nullptr);
+  struct tm tn;
+  localtime_r(&nowSec, &tn);
+  if (tn.tm_year + 1900 >= 2020) {
+    char buf[6];
+    snprintf(buf, sizeof(buf), "%02d:%02d", tn.tm_hour, tn.tm_min);
+    d->setTextSize(1);
+    d->setTextWrap(false);
+    d->setTextColor(scol(d, 120, 140, 180, dim));
+    d->setCursor(2, 25);
+    d->print(buf);
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  SPOTIFY FACE  (ported from simulator/face_spotify.js — 30×30 album cover +
+//  compact 3×5 text: title/artist marquees, elapsed timer, progress bar. Album
+//  art is RGB565 pushed from the backend; this face only blits it.)
+// ═════════════════════════════════════════════════════════════════════════════
+namespace spotifyface {
+  const int   RCOL = 34, RW = 30;                // right column: x start, width (RCOL, not RX — RX is a pin macro)
+  const float SCROLL_SPEED = 14.0f;              // marquee px/sec
+  const int   SCROLL_GAP   = 8;                  // px between marquee repeats
+
+  inline uint16_t dimc(MatrixPanel_I2S_DMA* d, int r, int g, int b, float f) {
+    return d->color565((int)(r * f), (int)(g * f), (int)(b * f));
+  }
+
+  // ── Compact 3×5 font (verbatim from the JS face; uppercase only) ──
+  struct TinyGlyph { char c; const char* rows[5]; };
+  const TinyGlyph TINY[] = {
+    {' ', {"...","...","...","...","..."}},
+    {'0', {"###","#.#","#.#","#.#","###"}}, {'1', {".#.","##.",".#.",".#.","###"}},
+    {'2', {"##.","..#",".#.","#..","###"}}, {'3', {"##.","..#",".#.","..#","##."}},
+    {'4', {"#.#","#.#","###","..#","..#"}}, {'5', {"###","#..","##.","..#","##."}},
+    {'6', {".##","#..","###","#.#","###"}}, {'7', {"###","..#",".#.",".#.",".#."}},
+    {'8', {"###","#.#","###","#.#","###"}}, {'9', {"###","#.#","###","..#","##."}},
+    {'A', {".#.","#.#","###","#.#","#.#"}}, {'B', {"##.","#.#","##.","#.#","##."}},
+    {'C', {".##","#..","#..","#..",".##"}}, {'D', {"##.","#.#","#.#","#.#","##."}},
+    {'E', {"###","#..","##.","#..","###"}}, {'F', {"###","#..","##.","#..","#.."}},
+    {'G', {".##","#..","#.#","#.#",".##"}}, {'H', {"#.#","#.#","###","#.#","#.#"}},
+    {'I', {"###",".#.",".#.",".#.","###"}}, {'J', {"..#","..#","..#","#.#",".#."}},
+    {'K', {"#.#","#.#","##.","#.#","#.#"}}, {'L', {"#..","#..","#..","#..","###"}},
+    {'M', {"#.#","###","###","#.#","#.#"}}, {'N', {"#.#","##.","###",".##","#.#"}},
+    {'O', {".#.","#.#","#.#","#.#",".#."}}, {'P', {"##.","#.#","##.","#..","#.."}},
+    {'Q', {".#.","#.#","#.#","###",".##"}}, {'R', {"##.","#.#","##.","#.#","#.#"}},
+    {'S', {".##","#..",".#.","..#","##."}}, {'T', {"###",".#.",".#.",".#.",".#."}},
+    {'U', {"#.#","#.#","#.#","#.#","###"}}, {'V', {"#.#","#.#","#.#","#.#",".#."}},
+    {'W', {"#.#","#.#","###","###","#.#"}}, {'X', {"#.#","#.#",".#.","#.#","#.#"}},
+    {'Y', {"#.#","#.#",".#.",".#.",".#."}}, {'Z', {"###","..#",".#.","#..","###"}},
+    {'.', {"...","...","...","...",".#."}}, {',', {"...","...","...",".#.","#.."}},
+    {'\'',{".#.",".#.","...","...","..."}}, {'-', {"...","...","###","...","..."}},
+    {':', {"...",".#.","...",".#.","..."}}, {'!', {".#.",".#.",".#.","...",".#."}},
+    {'?', {"##.","..#",".#.","...",".#."}}, {'&', {".#.","#.#",".#.","#.#",".##"}},
+    {'/', {"..#","..#",".#.","#..","#.."}}, {'(', {".#.","#..","#..","#..",".#."}},
+    {')', {".#.","..#","..#","..#",".#."}}, {'+', {"...",".#.","###",".#.","..."}},
+  };
+  const int TINY_N = sizeof(TINY) / sizeof(TINY[0]);
+
+  const char* const* glyphFor(char c) {
+    if (c >= 'a' && c <= 'z') c -= 32;           // lowercase → small-caps
+    for (int i = 0; i < TINY_N; i++) if (TINY[i].c == c) return TINY[i].rows;
+    return TINY[0].rows;                         // unknown → blank
+  }
+
+  // Draw 3×5 text, clipped to [clipL, clipR] so scrolling text can't bleed left.
+  void drawTiny(MatrixPanel_I2S_DMA* d, const char* s, int x, int y, uint16_t color,
+                int clipL, int clipR) {
+    int cx = x;
+    for (const char* p = s; *p; ++p) {
+      const char* const* g = glyphFor(*p);
+      for (int row = 0; row < 5; row++)
+        for (int col = 0; col < 3; col++)
+          if (g[row][col] == '#') {
+            int px = cx + col;
+            if (px >= clipL && px <= clipR) d->drawPixel(px, y + row, color);
+          }
+      cx += 4;                                   // 3 px glyph + 1 px gap
+    }
+  }
+  int textW(const char* s) { int n = 0; for (const char* p = s; *p; ++p) n++; return n * 4; }
+
+  void marquee(MatrixPanel_I2S_DMA* d, const char* s, int y, uint16_t color) {
+    int w = textW(s);
+    if (w <= RW) { drawTiny(d, s, RCOL, y, color, RCOL, 63); return; }   // fits → static
+    int period = w + SCROLL_GAP;
+    int off = (int)fmodf(millis() * SCROLL_SPEED / 1000.0f, (float)period);
+    drawTiny(d, s, RCOL - off,          y, color, RCOL, 63);             // two copies → wrap
+    drawTiny(d, s, RCOL - off + period, y, color, RCOL, 63);
+  }
+
+  void msFmt(uint32_t ms, char* buf) {           // "m:ss"
+    uint32_t s = ms / 1000;
+    snprintf(buf, 8, "%u:%02u", (unsigned)(s / 60), (unsigned)(s % 60));
+  }
+
+  void drawEq(MatrixPanel_I2S_DMA* d, int x, int baseY) {   // 3-bar equaliser (playing)
+    uint16_t c = d->color565(29, 185, 84);
+    for (int i = 0; i < 3; i++) {
+      int h = 1 + (int)roundf((sinf(millis() / (140.0f + i * 55) + i * 1.7f) * 0.5f + 0.5f) * 5);
+      d->drawFastVLine(x + i * 2, baseY - h + 1, h, c);
+    }
+  }
+
+  void drawPause(MatrixPanel_I2S_DMA* d, int x, int y) {    // pause glyph (paused)
+    uint16_t c = d->color565(120, 150, 130);
+    d->fillRect(x, y, 1, 5, c);
+    d->fillRect(x + 2, y, 1, 5, c);
+  }
+
+  void drawIdle(MatrixPanel_I2S_DMA* d) {        // nothing playing → note + label
+    uint16_t g = d->color565(25, 157, 71);
+    d->fillCircle(29, 15, 2, g);
+    d->drawFastVLine(31, 7, 9, g);
+    d->drawFastHLine(31, 7, 4, g);
+    d->drawPixel(34, 8, g);
+    drawTiny(d, "NOT PLAYING", 10, 22, d->color565(120, 150, 130), 0, 63);
+  }
+}
+
+void spotifySetup() {
+  // Nothing to seed — state arrives from the network task.
+}
+
+void spotifyLoop(MatrixPanel_I2S_DMA* d) {
+  using namespace spotifyface;
+  d->fillScreen(0);
+
+  // Snapshot shared state (+ art) under the mutex, then render lock-free.
+  static uint16_t artCopy[ALBUM_ART * ALBUM_ART];
+  SpotifyState s;
+  bool haveArt;
+  xSemaphoreTake(spotifyMutex, portMAX_DELAY);
+  s = spotifyShared;
+  haveArt = albumArtValid;
+  if (haveArt) memcpy(artCopy, albumArt, sizeof(artCopy));
+  xSemaphoreGive(spotifyMutex);
+
+  if (!s.active) { drawIdle(d); return; }        // Spotify closed / idle
+
+  // Interpolate elapsed time from the last poll (only while actually playing).
+  uint32_t prog = s.progressMs;
+  if (s.playing) prog += millis() - s.progressAtMillis;
+  if (prog > s.durationMs) prog = s.durationMs;
+  float frac = s.durationMs ? (float)prog / s.durationMs : 0.0f;
+  float dimF = s.playing ? 1.0f : 0.5f;          // paused → dim
+
+  // ── Album cover (inset 1 px off the edges) ──
+  if (haveArt) {
+    for (int yy = 0; yy < ALBUM_ART; yy++)
+      for (int xx = 0; xx < ALBUM_ART; xx++)
+        d->drawPixel(1 + xx, 1 + yy, artCopy[yy * ALBUM_ART + xx]);
+  } else {
+    d->fillRect(1, 1, ALBUM_ART, ALBUM_ART, d->color565(20, 25, 22));   // placeholder
+  }
+
+  // ── Title / artist marquees ──
+  marquee(d, s.title,  2, dimc(d, 235, 235, 235, dimF));
+  marquee(d, s.artist, 8, dimc(d, 120, 150, 130, dimF));
+
+  // ── Elapsed timer (just above the bar) + equaliser / pause glyph ──
+  char t[8]; msFmt(prog, t);
+  drawTiny(d, t, RCOL, 22, s.playing ? d->color565(29, 185, 84) : d->color565(120, 150, 130), RCOL, 63);
+  if (s.playing) drawEq(d, 57, 26);
+  else           drawPause(d, 58, 22);
+
+  // ── Progress bar (1 px) + playhead ──
+  d->drawFastHLine(RCOL, 29, RW, d->color565(45, 55, 50));
+  int fillW = (int)roundf(RW * frac);
+  if (fillW > 0) d->drawFastHLine(RCOL, 29, fillW, dimc(d, 29, 185, 84, dimF));
+  d->drawFastVLine(RCOL + (fillW < RW ? fillW : RW - 1), 28, 2, d->color565(120, 255, 160));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 //  NETWORK TASK  (core 0) — polls the backend, writes requestedFaceId
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -608,6 +982,104 @@ static void pollConnected() {
   http.end();
 }
 
+// Which track's cover we currently hold (network-task-local). Empty = none yet.
+static char spotifyArtTrack[24] = "";
+
+// Fetch the current cover as raw RGB565 bytes into albumArt[]. Returns true on success.
+static bool pollSpotifyArt() {
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient http;
+  String url = String("https://") + BACKEND_BASE_URL + "/spotify/art";
+  if (!http.begin(client, url)) return false;
+  http.addHeader("X-API-Key", BACKEND_API_KEY);
+  http.setTimeout(6000);
+
+  const int EXPECT = ALBUM_ART * ALBUM_ART * 2;   // 1800 bytes
+  bool ok = false;
+  int code = http.GET();
+  if (code == 200 && http.getSize() == EXPECT) {
+    static uint8_t raw[ALBUM_ART * ALBUM_ART * 2];   // static: keep it off the TLS stack
+    WiFiClient* stream = http.getStreamPtr();
+    int got = 0;
+    uint32_t start = millis();
+    while (got < EXPECT && millis() - start < 6000) {
+      int avail = stream->available();
+      if (avail > 0) {
+        got += stream->readBytes(raw + got, min(avail, EXPECT - got));
+      } else if (!http.connected()) {
+        break;
+      } else {
+        delay(2);
+      }
+    }
+    if (got == EXPECT) {
+      xSemaphoreTake(spotifyMutex, portMAX_DELAY);
+      for (int i = 0; i < ALBUM_ART * ALBUM_ART; i++)
+        albumArt[i] = ((uint16_t)raw[2 * i] << 8) | raw[2 * i + 1];   // big-endian
+      albumArtValid = true;
+      xSemaphoreGive(spotifyMutex);
+      ok = true;
+    }
+  } else if (code != 204) {
+    Serial.printf("[net] /spotify/art HTTP %d (size %d)\n", code, http.getSize());
+  }
+  http.end();
+  return ok;
+}
+
+static void pollSpotifyState() {
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient http;
+  String url = String("https://") + BACKEND_BASE_URL + "/spotify/state";
+  if (!http.begin(client, url)) return;
+  http.addHeader("X-API-Key", BACKEND_API_KEY);
+  http.setTimeout(6000);
+
+  int code = http.GET();
+  if (code == 200) {
+    JsonDocument doc;
+    if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
+      bool        active  = doc["active"]  | false;
+      const char* trackId = doc["track_id"] | "";
+      bool        hasArt  = doc["has_art"] | false;
+
+      xSemaphoreTake(spotifyMutex, portMAX_DELAY);
+      spotifyShared.active  = active;
+      spotifyShared.playing = doc["playing"] | false;
+      strncpy(spotifyShared.title,  doc["title"]  | "", sizeof(spotifyShared.title)  - 1);
+      strncpy(spotifyShared.artist, doc["artist"] | "", sizeof(spotifyShared.artist) - 1);
+      strncpy(spotifyShared.trackId, trackId,           sizeof(spotifyShared.trackId) - 1);
+      spotifyShared.title[sizeof(spotifyShared.title) - 1]     = '\0';
+      spotifyShared.artist[sizeof(spotifyShared.artist) - 1]   = '\0';
+      spotifyShared.trackId[sizeof(spotifyShared.trackId) - 1] = '\0';
+      spotifyShared.durationMs       = doc["duration_ms"] | 0;
+      spotifyShared.progressMs       = doc["progress_ms"] | 0;
+      spotifyShared.progressAtMillis = millis();
+      spotifyShared.hasArt           = hasArt;
+      xSemaphoreGive(spotifyMutex);
+
+      // Fetch the cover only when the track changes (not every poll).
+      if (!active) {
+        spotifyArtTrack[0] = '\0';                     // reset → next track refetches
+      } else if (strcmp(trackId, spotifyArtTrack) != 0) {
+        if (hasArt && pollSpotifyArt()) {
+          strncpy(spotifyArtTrack, trackId, sizeof(spotifyArtTrack) - 1);
+          spotifyArtTrack[sizeof(spotifyArtTrack) - 1] = '\0';
+        } else if (!hasArt) {
+          xSemaphoreTake(spotifyMutex, portMAX_DELAY);
+          albumArtValid = false;                        // no cover for this track
+          xSemaphoreGive(spotifyMutex);
+          strncpy(spotifyArtTrack, trackId, sizeof(spotifyArtTrack) - 1);
+          spotifyArtTrack[sizeof(spotifyArtTrack) - 1] = '\0';
+        }
+      }
+    }
+  } else {
+    Serial.printf("[net] /spotify/state HTTP %d\n", code);
+  }
+  http.end();
+}
+
 static void networkTask(void* pv) {
   // Connect WiFi on this core so a slow join never blocks rendering.
   WiFi.mode(WIFI_STA);
@@ -628,7 +1100,8 @@ static void networkTask(void* pv) {
   const uint32_t STATE_MS     = 3000;      // face switch responsiveness
   const uint32_t WEATHER_MS   = 180000;    // 3 min (backend caches 10 min)
   const uint32_t CONNECTED_MS = 20000;     // 20 s (presence changes slowly)
-  uint32_t lastState = 0, lastWeather = 0, lastConnected = 0;
+  const uint32_t SPOTIFY_MS   = 5000;      // 5 s — only while the spotify face is up
+  uint32_t lastState = 0, lastWeather = 0, lastConnected = 0, lastSpotify = 0;
 
   for (;;) {
     if (WiFi.status() == WL_CONNECTED) {
@@ -636,6 +1109,14 @@ static void networkTask(void* pv) {
       if (now - lastState >= STATE_MS)              { pollDisplayState(); lastState = now; }
       if (lastWeather == 0 || now - lastWeather >= WEATHER_MS)   { pollWeather();   lastWeather = now; }
       if (lastConnected == 0 || now - lastConnected >= CONNECTED_MS) { pollConnected(); lastConnected = now; }
+
+      // Poll Spotify only when its face is showing (saves API calls the rest of the
+      // day). Reset the timer when it isn't, so it polls immediately on activation.
+      if (requestedFaceId == spotifyFaceId) {
+        if (lastSpotify == 0 || now - lastSpotify >= SPOTIFY_MS) { pollSpotifyState(); lastSpotify = now; }
+      } else {
+        lastSpotify = 0;
+      }
     } else {
       WiFi.reconnect();
     }
@@ -674,6 +1155,10 @@ void setup() {
 
   // Guards the presence roster shared between the network and render cores.
   rosterMutex = xSemaphoreCreateMutex();
+
+  // Guards the Spotify state + album-art buffer shared across cores.
+  spotifyMutex = xSemaphoreCreateMutex();
+  spotifyFaceId = faceIndexForSlug("spotify");
 
   // Networking on core 0 (large stack — TLS handshake is stack-hungry).
   xTaskCreatePinnedToCore(networkTask, "network", 12288, nullptr, 1, nullptr, 0);
