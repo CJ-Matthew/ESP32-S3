@@ -1098,7 +1098,7 @@ static void networkTask(void* pv) {
   // Three independent poll cadences (see DESIGN.md). Each tracks its own "last
   // polled" time; the task ticks every 500ms and fires whichever is due.
   const uint32_t STATE_MS     = 3000;      // face switch responsiveness
-  const uint32_t WEATHER_MS   = 180000;    // 3 min (backend caches 10 min)
+  const uint32_t WEATHER_MS   = 180000;    // 3 min (backend caches 3 min)
   const uint32_t CONNECTED_MS = 20000;     // 20 s (presence changes slowly)
   const uint32_t SPOTIFY_MS   = 5000;      // 5 s — only while the spotify face is up
   uint32_t lastState = 0, lastWeather = 0, lastConnected = 0, lastSpotify = 0;
